@@ -7,13 +7,7 @@ on:
         description: "Whisper model to embed"
         type: choice
         default: base
-        options:
-          - tiny
-          - tiny.en
-          - base
-          - base.en
-          - small
-          - small.en
+        options: [tiny, tiny.en, base, base.en, small, small.en]
   push:
     branches: [ master ]
   pull_request:
@@ -36,6 +30,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 👇 This makes Buildx use the "docker-container" driver so GHA cache works
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true         # sets buildx as default builder
+          driver: docker-container
+          # Optional: newer buildkit image
+          driver-opts: image=moby/buildkit:latest
 
       - name: Log in to GHCR
         if: ${{ github.event_name != 'pull_request' }}
@@ -66,6 +69,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             MODEL_VARIANT=${{ github.event.inputs.model || 'base' }}
+          # ✅ GHA cache now supported thanks to docker-container driver
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
