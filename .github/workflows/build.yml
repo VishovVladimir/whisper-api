@@ -1,0 +1,77 @@
+name: Build & Publish whisper-cpp-rest
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Whisper model to embed"
+        type: choice
+        default: base
+        options:
+          - tiny
+          - tiny.en
+          - base
+          - base.en
+          - small
+          - small.en
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Docker tags/labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
+            type=raw,value=${{ github.event.inputs.model || 'base' }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model != '' }}
+
+      - name: Build (and push if not PR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            MODEL_VARIANT=${{ github.event.inputs.model || 'base' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Show resulting tags
+        run: |
+          echo "Published image(s):"
+          echo "${{ steps.meta.outputs.tags }}"
