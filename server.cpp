@@ -228,22 +228,17 @@ int main() {
         }
 
         whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        wparams.print_progress             = false;
-        wparams.print_realtime             = false;
-        wparams.print_timestamps           = false;
-        wparams.translate                  = false;
-        wparams.no_timestamps              = true;
-        wparams.n_threads                  = N_THREADS;      // keep single-threaded
-        wparams.language                   = language.c_str();
-        wparams.token_timestamps           = false;
-        wparams.temperature                = 0.0f;
-        wparams.max_initial_ts             = 0.0f;
-
-        // Compute-saving / stability flags (compatible across whisper.cpp versions)
-        wparams.suppress_blank             = true;
-        wparams.suppress_non_speech_tokens = true;  // <- correct field name
-        wparams.n_max_text_ctx             = 0;
-        wparams.no_context                 = true;
+        wparams.print_progress        = false;
+        wparams.print_realtime        = false;
+        wparams.print_timestamps      = false;
+        wparams.translate             = false;
+        wparams.no_timestamps         = true;
+        wparams.n_threads             = N_THREADS;      // keep single-threaded
+        wparams.language              = language.c_str();
+        wparams.token_timestamps      = false;
+        wparams.temperature           = 0.0f;
+        wparams.max_initial_ts        = 0.0f;
+        wparams.no_context            = true;           // present in old & new versions
 
         int rc = 0;
         {
