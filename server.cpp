@@ -25,6 +25,10 @@ static int         N_THREADS   = []{
     if (const char* e = std::getenv("WHISPER_THREADS")) return std::max(1, std::atoi(e));
     return 1;
 }();
+static int         MAX_AUDIO_SEC = []{
+    if (const char* e = std::getenv("MAX_AUDIO_SEC")) return std::max(1, std::atoi(e));
+    return 120; // hard cap 2 minutes by default
+}();
 
 static inline std::string json_escape(const std::string& s) {
     std::string o; o.reserve(s.size() + 16);
@@ -41,7 +45,7 @@ static inline std::string json_escape(const std::string& s) {
     return o;
 }
 
-// ---------- Decode from memory to mono 16k float ----------
+// ---------- Decode from memory to mono 16k float (FFmpeg forced single-thread) ----------
 static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<float>& pcmf32) {
     AVFormatContext* fmt = avformat_alloc_context();
     if (!fmt) return false;
@@ -79,7 +83,7 @@ static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<f
         return false;
     }
     fmt->pb = avio;
-    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOBUFFER;
 
     bool ok = false;
 
@@ -92,61 +96,76 @@ static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<f
             const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
             if (dec) {
                 AVCodecContext* codec = avcodec_alloc_context3(dec);
-                if (codec && avcodec_parameters_to_context(codec, st->codecpar) >= 0 &&
-                    avcodec_open2(codec, dec, nullptr) >= 0) {
+                if (codec && avcodec_parameters_to_context(codec, st->codecpar) >= 0) {
 
-                    int in_rate = codec->sample_rate > 0 ? codec->sample_rate : 48000;
-                    int in_ch   = codec->channels     > 0 ? codec->channels     : 2;
-                    int64_t in_layout = codec->channel_layout ?
-                        codec->channel_layout : av_get_default_channel_layout(in_ch);
+                    // Force single-threaded decode
+                    codec->thread_count = 1;
+                    codec->thread_type  = 0; // fully disable multi-threading
+                    AVDictionary* open_opts = nullptr;
+                    av_dict_set(&open_opts, "threads", "1", 0);
 
-                    SwrContext* swr = swr_alloc_set_opts(
-                        nullptr,
-                        av_get_default_channel_layout(1), AV_SAMPLE_FMT_FLT, 16000,
-                        in_layout, codec->sample_fmt, in_rate,
-                        0, nullptr);
+                    int open_rc = avcodec_open2(codec, dec, &open_opts);
+                    av_dict_free(&open_opts);
 
-                    if (swr && swr_init(swr) >= 0) {
-                        AVPacket* pkt = av_packet_alloc();
-                        AVFrame*  frm = av_frame_alloc();
-                        if (pkt && frm) {
-                            pcmf32.clear();
+                    if (open_rc >= 0) {
+                        int in_rate = codec->sample_rate > 0 ? codec->sample_rate : 48000;
+                        int in_ch   = codec->channels     > 0 ? codec->channels     : 2;
+                        int64_t in_layout = codec->channel_layout ?
+                            codec->channel_layout : av_get_default_channel_layout(in_ch);
 
-                            while (av_read_frame(fmt, pkt) >= 0) {
-                                if (pkt->stream_index != astream) { av_packet_unref(pkt); continue; }
-                                if (avcodec_send_packet(codec, pkt) < 0) { av_packet_unref(pkt); continue; }
-                                av_packet_unref(pkt);
+                        SwrContext* swr = swr_alloc_set_opts(
+                            nullptr,
+                            av_get_default_channel_layout(1), AV_SAMPLE_FMT_FLT, 16000,  // mono float 16k
+                            in_layout, codec->sample_fmt, in_rate,
+                            0, nullptr);
 
-                                while (true) {
-                                    int r = avcodec_receive_frame(codec, frm);
-                                    if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
-                                    if (r < 0) break;
+                        if (swr && swr_init(swr) >= 0) {
+                            AVPacket* pkt = av_packet_alloc();
+                            AVFrame*  frm = av_frame_alloc();
+                            if (pkt && frm) {
+                                pcmf32.clear();
+                                std::vector<float> out;
+                                out.reserve(16000); // ~1 second
 
-                                    const int out_needed = av_rescale_rnd(
-                                        swr_get_delay(swr, in_rate) + frm->nb_samples,
-                                        16000, in_rate, AV_ROUND_UP);
+                                while (av_read_frame(fmt, pkt) >= 0) {
+                                    if (pkt->stream_index != astream) { av_packet_unref(pkt); continue; }
+                                    if (avcodec_send_packet(codec, pkt) < 0) { av_packet_unref(pkt); continue; }
+                                    av_packet_unref(pkt);
 
-                                    std::vector<float> out((size_t)out_needed);
-                                    uint8_t* out_data = (uint8_t*)out.data();
+                                    while (true) {
+                                        int r = avcodec_receive_frame(codec, frm);
+                                        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
+                                        if (r < 0) break;
 
-                                    int got = swr_convert(swr, &out_data, out_needed,
-                                                          (const uint8_t**)frm->data, frm->nb_samples);
-                                    if (got > 0) {
-                                        out.resize((size_t)got);
-                                        pcmf32.insert(pcmf32.end(), out.begin(), out.end());
+                                        const int out_needed = av_rescale_rnd(
+                                            swr_get_delay(swr, in_rate) + frm->nb_samples,
+                                            16000, in_rate, AV_ROUND_UP);
+
+                                        if ((int)out.capacity() < out_needed)
+                                            out.reserve(out_needed);
+                                        uint8_t* out_data = (uint8_t*)out.data();
+
+                                        int got = swr_convert(swr, &out_data, out_needed,
+                                                              (const uint8_t**)frm->data, frm->nb_samples);
+                                        if (got > 0) {
+                                            out.resize((size_t)got);
+                                            pcmf32.insert(pcmf32.end(), out.begin(), out.end());
+                                        }
+                                        av_frame_unref(frm);
                                     }
-                                    av_frame_unref(frm);
                                 }
+
+                                ok = !pcmf32.empty();
                             }
-
-                            ok = !pcmf32.empty();
+                            if (pkt) av_packet_free(&pkt);
+                            if (frm) av_frame_free(&frm);
+                            swr_free(&swr);
                         }
-                        if (pkt) av_packet_free(&pkt);
-                        if (frm) av_frame_free(&frm);
-                        swr_free(&swr);
-                    }
 
-                    avcodec_free_context(&codec);
+                        avcodec_free_context(&codec);
+                    } else {
+                        avcodec_free_context(&codec);
+                    }
                 } else if (codec) {
                     avcodec_free_context(&codec);
                 }
@@ -154,10 +173,10 @@ static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<f
         }
     }
 
-    // Порядок освобождения: сначала формат, затем AVIO, потом наш буфер и контекст
+    // Free in a safe order
     avformat_close_input(&fmt);
-    avio_context_free(&avio);        // освободит iobuf
-    av_free((void*)mc->base);        // освобождаем ИМЕННО base, а не p!
+    avio_context_free(&avio);        // frees iobuf
+    av_free((void*)mc->base);        // free base (not p)
     av_free(mc);
 
     return ok;
@@ -166,7 +185,7 @@ static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<f
 int main() {
     if (const char* e = std::getenv("WHISPER_MODEL")) MODEL_PATH = e;
 
-    // Инициализируем whisper-модель один раз
+    // Init whisper model once
     {
         whisper_context_params cparams = whisper_context_default_params();
         g_ctx = whisper_init_from_file_with_params(MODEL_PATH.c_str(), cparams);
@@ -202,17 +221,30 @@ int main() {
             return;
         }
 
+        // Hard cap duration to limit work
+        const size_t max_samples = (size_t)MAX_AUDIO_SEC * 16000;
+        if (pcmf32.size() > max_samples) {
+            pcmf32.resize(max_samples);
+        }
+
         whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        wparams.print_progress   = false;
-        wparams.print_realtime   = false;
-        wparams.print_timestamps = false;
-        wparams.translate        = false;
-        wparams.no_timestamps    = true;
-        wparams.n_threads        = N_THREADS;
-        wparams.language         = language.c_str();
-        wparams.token_timestamps = false;
-        wparams.temperature      = 0.0f;
-        wparams.max_initial_ts   = 0.0f;
+        wparams.print_progress        = false;
+        wparams.print_realtime        = false;
+        wparams.print_timestamps      = false;
+        wparams.translate             = false;
+        wparams.no_timestamps         = true;
+        wparams.n_threads             = N_THREADS;      // keep single-threaded
+        wparams.language              = language.c_str();
+        wparams.token_timestamps      = false;
+        wparams.temperature           = 0.0f;
+        wparams.max_initial_ts        = 0.0f;
+
+        // Compute-saving flags
+        wparams.speed_up              = true;           // ~2x faster, tiny loses little
+        wparams.suppress_blank        = true;
+        wparams.suppress_nst          = true;
+        wparams.n_max_text_ctx        = 0;
+        wparams.no_context            = true;
 
         int rc = 0;
         {
@@ -243,8 +275,8 @@ int main() {
 
     const char* host = "0.0.0.0";
     int port = 8081;
-    fprintf(stderr, "Listening on %s:%d, threads=%d, model=%s\n",
-            host, port, N_THREADS, MODEL_PATH.c_str());
+    fprintf(stderr, "Listening on %s:%d, threads=%d, model=%s (max_audio_sec=%d)\n",
+            host, port, N_THREADS, MODEL_PATH.c_str(), MAX_AUDIO_SEC);
     app.listen(host, port);
 
     if (g_ctx) { whisper_free(g_ctx); g_ctx = nullptr; }

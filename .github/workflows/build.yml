@@ -4,10 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Whisper model to embed"
+        description: "Whisper model family"
         type: choice
-        default: base
+        default: tiny
         options: [tiny, tiny.en, base, base.en, small, small.en]
+      qtype:
+        description: "Quantization"
+        type: choice
+        default: q5_1
+        options: [q5_1, q5_0, q4_1, f16]
   push:
     branches: [ master ]
   pull_request:
@@ -31,13 +36,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 👇 This makes Buildx use the "docker-container" driver so GHA cache works
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          install: true         # sets buildx as default builder
+          install: true
           driver: docker-container
-          # Optional: newer buildkit image
           driver-opts: image=moby/buildkit:latest
 
       - name: Log in to GHCR
@@ -55,10 +58,12 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
+            whisper.model=${{ github.event.inputs.model || 'tiny' }}
+            whisper.qtype=${{ github.event.inputs.qtype || 'q5_1' }}
           tags: |
             type=sha
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
-            type=raw,value=${{ github.event.inputs.model || 'base' }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model != '' }}
+            type=raw,value=${{ (github.event.inputs.model || 'tiny') }}-${{ (github.event.inputs.qtype || 'q5_1') }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build (and push if not PR)
         uses: docker/build-push-action@v6
@@ -68,8 +73,8 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
-            MODEL_VARIANT=${{ github.event.inputs.model || 'base' }}
-          # ✅ GHA cache now supported thanks to docker-container driver
+            MODEL=${{ github.event.inputs.model || 'tiny' }}
+            QTYPE=${{ github.event.inputs.qtype || 'q5_1' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
