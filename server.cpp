@@ -27,7 +27,7 @@ static int         N_THREADS   = []{
 }();
 static int         MAX_AUDIO_SEC = []{
     if (const char* e = std::getenv("MAX_AUDIO_SEC")) return std::max(1, std::atoi(e));
-    return 120; // hard cap 2 minutes by default
+    return 120; // default: 2 minutes
 }();
 
 static inline std::string json_escape(const std::string& s) {
@@ -100,7 +100,7 @@ static bool decode_to_pcm16k_f32(const uint8_t* data, size_t size, std::vector<f
 
                     // Force single-threaded decode
                     codec->thread_count = 1;
-                    codec->thread_type  = 0; // fully disable multi-threading
+                    codec->thread_type  = 0; // disable multi-threading
                     AVDictionary* open_opts = nullptr;
                     av_dict_set(&open_opts, "threads", "1", 0);
 
@@ -228,23 +228,22 @@ int main() {
         }
 
         whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        wparams.print_progress        = false;
-        wparams.print_realtime        = false;
-        wparams.print_timestamps      = false;
-        wparams.translate             = false;
-        wparams.no_timestamps         = true;
-        wparams.n_threads             = N_THREADS;      // keep single-threaded
-        wparams.language              = language.c_str();
-        wparams.token_timestamps      = false;
-        wparams.temperature           = 0.0f;
-        wparams.max_initial_ts        = 0.0f;
+        wparams.print_progress             = false;
+        wparams.print_realtime             = false;
+        wparams.print_timestamps           = false;
+        wparams.translate                  = false;
+        wparams.no_timestamps              = true;
+        wparams.n_threads                  = N_THREADS;      // keep single-threaded
+        wparams.language                   = language.c_str();
+        wparams.token_timestamps           = false;
+        wparams.temperature                = 0.0f;
+        wparams.max_initial_ts             = 0.0f;
 
-        // Compute-saving flags
-        wparams.speed_up              = true;           // ~2x faster, tiny loses little
-        wparams.suppress_blank        = true;
-        wparams.suppress_nst          = true;
-        wparams.n_max_text_ctx        = 0;
-        wparams.no_context            = true;
+        // Compute-saving / stability flags (compatible across whisper.cpp versions)
+        wparams.suppress_blank             = true;
+        wparams.suppress_non_speech_tokens = true;  // <- correct field name
+        wparams.n_max_text_ctx             = 0;
+        wparams.no_context                 = true;
 
         int rc = 0;
         {
